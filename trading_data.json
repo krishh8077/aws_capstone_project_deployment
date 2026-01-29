@@ -1,0 +1,25 @@
+{
+  "krishh": {
+    "password": "1234",
+    "balance": 9818.08,
+    "portfolio": {
+      "AMZN": {
+        "shares": 1,
+        "avg_price": 181.92
+      }
+    },
+    "transactions": [
+      {
+        "id": "44c447ef-1923-46b9-ac31-1b46d0294f6f",
+        "type": "BUY",
+        "symbol": "AMZN",
+        "quantity": 1,
+        "price": 181.92,
+        "total": 181.92,
+        "timestamp": "2026-01-19T23:07:33.383679",
+        "status": "CONFIRMED"
+      }
+    ],
+    "created_at": "2026-01-19T23:06:46.232771"
+  }
+}
