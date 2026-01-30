@@ -339,3 +339,4 @@ class AWSManager:
 # Global AWS Manager instance
 aws_manager = AWSManager()
 
+
