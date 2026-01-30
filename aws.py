@@ -1,3 +1,4 @@
+
 """
 AWS Integration Module for Stock Trading Platform
 Handles DynamoDB, SNS, and other AWS services
@@ -24,7 +25,7 @@ class AWSConfig:
     def __init__(self):
         self.region = os.environ.get('AWS_REGION', 'us-east-1')
         self.dynamodb_endpoint = os.environ.get('DYNAMODB_ENDPOINT', None)
-        self.sns_topic_arn = 'arn:aws:sns:us-east-1:086227530655:aws_capstone_topic'
+        self.sns_topic_arn = os.environ.get('SNS_TOPIC_ARN', '')
         
     def get_dynamodb_resource(self):
         """Get DynamoDB resource"""
@@ -338,5 +339,4 @@ class AWSManager:
 
 # Global AWS Manager instance
 aws_manager = AWSManager()
-
 
