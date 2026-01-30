@@ -22,8 +22,8 @@ except Exception:
 # AWS SNS Configuration (optional - set up only if you have AWS credentials)
 try:
     sns_client = boto3.client('sns', region_name='us-east-1')
-    SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:086227530655:aws_capstone_topic'
-    SNS_ENABLED = True  # Set to True when configured
+    SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:YOUR_ACCOUNT_ID:stock-trading-notifications'
+    SNS_ENABLED = False  # Set to True when configured
 except:
     SNS_ENABLED = False
     sns_client = None
@@ -581,4 +581,5 @@ def transactions():
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
 
