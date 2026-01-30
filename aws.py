@@ -1,342 +1,584 @@
 
-"""
-AWS Integration Module for Stock Trading Platform
-Handles DynamoDB, SNS, and other AWS services
-"""
-
-import boto3
-import json
-from botocore.exceptions import ClientError
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, flash
 from datetime import datetime
+import json
 import os
-from decimal import Decimal
+from functools import wraps
+import boto3
+import uuid
 
-class DecimalEncoder(json.JSONEncoder):
-    """Helper class to convert DynamoDB Decimal to float"""
-    def default(self, o):
-        if isinstance(o, Decimal):
-            return float(o)
-        return super(DecimalEncoder, self).default(o)
+app = Flask(__name__)
+# Load secret from environment for production safety
+app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'your-secret-key-change-this-in-production')
 
+# Toggle using DynamoDB for persistence
+USE_DYNAMODB = os.environ.get('USE_DYNAMODB', 'false').lower() == 'true'
 
-class AWSConfig:
-    """AWS Configuration"""
-    
-    def __init__(self):
-        self.region = os.environ.get('AWS_REGION', 'us-east-1')
-        self.dynamodb_endpoint = os.environ.get('DYNAMODB_ENDPOINT', None)
-        self.sns_topic_arn = os.environ.get('SNS_TOPIC_ARN', '')
-        
-    def get_dynamodb_resource(self):
-        """Get DynamoDB resource"""
-        kwargs = {'region_name': self.region}
-        if self.dynamodb_endpoint:
-            kwargs['endpoint_url'] = self.dynamodb_endpoint
-        return boto3.resource('dynamodb', **kwargs)
-    
-    def get_sns_client(self):
-        """Get SNS client"""
-        return boto3.client('sns', region_name=self.region)
+# Import AWS manager if DynamoDB mode enabled (aws_manager created in aws.py)
+try:
+    from aws import aws_manager
+except Exception:
+    aws_manager = None
 
+# AWS SNS Configuration (optional - set up only if you have AWS credentials)
+try:
+    sns_client = boto3.client('sns', region_name='us-east-1')
+    SNS_TOPIC_ARN = 'arn:aws:sns:us-east-1:YOUR_ACCOUNT_ID:stock-trading-notifications'
+    SNS_ENABLED = False  # Set to True when configured
+except:
+    SNS_ENABLED = False
+    sns_client = None
 
-class DynamoDBHandler:
-    """Handle all DynamoDB operations"""
-    
-    def __init__(self, config):
-        self.config = config
-        self.dynamodb = config.get_dynamodb_resource()
-        self.users_table = self.dynamodb.Table('StockTradingUsers')
-        self.portfolios_table = self.dynamodb.Table('StockTradingPortfolios')
-        self.transactions_table = self.dynamodb.Table('StockTradingTransactions')
-        self.stocks_table = self.dynamodb.Table('StockTradingStocks')
-    
-    # ==================== USER OPERATIONS ====================
-    
-    def create_user(self, username, password_hash):
-        """Create new user"""
-        try:
-            timestamp = datetime.utcnow().isoformat()
-            self.users_table.put_item(
-                Item={
-                    'username': username,
-                    'password': password_hash,
-                    'balance': Decimal('10000.00'),
-                    'created_at': timestamp,
-                    'updated_at': timestamp,
-                    'is_active': True
-                }
-            )
-            return True
-        except ClientError as e:
-            print(f"Error creating user: {e}")
-            return False
-    
-    def get_user(self, username):
-        """Get user by username"""
-        try:
-            response = self.users_table.get_item(Key={'username': username})
-            return response.get('Item', None)
-        except ClientError as e:
-            print(f"Error getting user: {e}")
-            return None
-    
-    def update_user_balance(self, username, new_balance):
-        """Update user's cash balance"""
-        try:
-            self.users_table.update_item(
-                Key={'username': username},
-                UpdateExpression='SET balance = :b, updated_at = :t',
-                ExpressionAttributeValues={
-                    ':b': Decimal(str(new_balance)),
-                    ':t': datetime.utcnow().isoformat()
-                }
-            )
-            return True
-        except ClientError as e:
-            print(f"Error updating balance: {e}")
-            return False
-    
-    # ==================== PORTFOLIO OPERATIONS ====================
-    
-    def get_portfolio(self, username):
-        """Get user's portfolio"""
-        try:
-            response = self.portfolios_table.get_item(Key={'username': username})
-            portfolio = response.get('Item', {})
-            if 'holdings' not in portfolio:
-                portfolio['holdings'] = {}
-            return portfolio
-        except ClientError as e:
-            print(f"Error getting portfolio: {e}")
-            return {'username': username, 'holdings': {}}
-    
-    def update_portfolio(self, username, holdings):
-        """Update user's portfolio holdings"""
-        try:
-            # Convert holdings to DynamoDB-compatible format
-            holdings_dict = {}
-            for symbol, data in holdings.items():
-                holdings_dict[symbol] = {
-                    'shares': Decimal(str(data.get('shares', 0))),
-                    'avg_price': Decimal(str(data.get('avg_price', 0))),
-                    'current_price': Decimal(str(data.get('current_price', 0)))
-                }
-            
-            self.portfolios_table.put_item(
-                Item={
-                    'username': username,
-                    'holdings': holdings_dict,
-                    'updated_at': datetime.utcnow().isoformat()
-                }
-            )
-            return True
-        except ClientError as e:
-            print(f"Error updating portfolio: {e}")
-            return False
-    
-    # ==================== TRANSACTION OPERATIONS ====================
-    
-    def add_transaction(self, username, transaction_type, symbol, quantity, price, total):
-        """Add transaction record"""
-        try:
-            transaction_id = f"{username}_{symbol}_{datetime.utcnow().timestamp()}"
-            
-            self.transactions_table.put_item(
-                Item={
-                    'transaction_id': transaction_id,
-                    'username': username,
-                    'type': transaction_type,  # BUY or SELL
-                    'symbol': symbol,
-                    'quantity': Decimal(str(quantity)),
-                    'price': Decimal(str(price)),
-                    'total': Decimal(str(total)),
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'status': 'COMPLETED'
-                }
-            )
-            return transaction_id
-        except ClientError as e:
-            print(f"Error adding transaction: {e}")
-            return None
-    
-    def get_transactions(self, username, limit=50):
-        """Get user's recent transactions"""
-        try:
-            response = self.transactions_table.query(
-                KeyConditionExpression='username = :u',
-                ExpressionAttributeValues={':u': username},
-                ScanIndexForward=False,  # Most recent first
-                Limit=limit
-            )
-            return response.get('Items', [])
-        except ClientError as e:
-            print(f"Error getting transactions: {e}")
-            return []
-    
-    # ==================== STOCK DATA OPERATIONS ====================
-    
-    def get_stock_price(self, symbol):
-        """Get current stock price"""
-        try:
-            response = self.stocks_table.get_item(Key={'symbol': symbol})
-            stock = response.get('Item', None)
-            if stock:
-                return {
-                    'symbol': stock['symbol'],
-                    'name': stock['name'],
-                    'price': float(stock['price']),
-                    'change': float(stock['change']),
-                    'change_percent': float(stock['change_percent'])
-                }
-            return None
-        except ClientError as e:
-            print(f"Error getting stock price: {e}")
-            return None
-    
-    def get_all_stocks(self):
-        """Get all available stocks"""
-        try:
-            response = self.stocks_table.scan()
-            stocks = []
-            for item in response.get('Items', []):
-                stocks.append({
-                    'symbol': item['symbol'],
-                    'name': item['name'],
-                    'price': float(item['price']),
-                    'change': float(item['change']),
-                    'change_percent': float(item['change_percent'])
-                })
-            return stocks
-        except ClientError as e:
-            print(f"Error getting stocks: {e}")
-            return []
-    
-    def update_stock_prices(self, stocks_data):
-        """Update stock prices in bulk"""
-        try:
-            with self.stocks_table.batch_writer() as batch:
-                for symbol, data in stocks_data.items():
-                    batch.put_item(
-                        Item={
-                            'symbol': symbol,
-                            'name': data['name'],
-                            'price': Decimal(str(data['price'])),
-                            'change': Decimal(str(data['change'])),
-                            'change_percent': Decimal(str(data['change_percent'])),
-                            'updated_at': datetime.utcnow().isoformat()
-                        }
-                    )
-            return True
-        except ClientError as e:
-            print(f"Error updating stocks: {e}")
-            return False
-    
-    def init_stocks_if_needed(self):
-        """Initialize stock data if empty"""
-        try:
-            response = self.stocks_table.scan()
-            if response['Count'] == 0:
-                stocks_data = {
-                    'AAPL': {'name': 'Apple Inc.', 'price': 185.45, 'change': 2.30, 'change_percent': 1.26},
-                    'GOOGL': {'name': 'Alphabet Inc.', 'price': 140.25, 'change': -1.75, 'change_percent': -1.23},
-                    'MSFT': {'name': 'Microsoft Corp.', 'price': 378.91, 'change': 3.45, 'change_percent': 0.92},
-                    'AMZN': {'name': 'Amazon.com Inc.', 'price': 175.85, 'change': -2.10, 'change_percent': -1.18},
-                    'TSLA': {'name': 'Tesla Inc.', 'price': 238.47, 'change': 5.62, 'change_percent': 2.41},
-                    'META': {'name': 'Meta Platforms Inc.', 'price': 310.28, 'change': 4.13, 'change_percent': 1.35},
-                    'NFLX': {'name': 'Netflix Inc.', 'price': 195.63, 'change': -3.28, 'change_percent': -1.65},
-                    'NVDA': {'name': 'NVIDIA Corp.', 'price': 875.41, 'change': 12.35, 'change_percent': 1.43}
-                }
-                self.update_stock_prices(stocks_data)
-                return True
-            return True
-        except ClientError as e:
-            print(f"Error initializing stocks: {e}")
-            return False
+# Data storage (in production, use a database)
+DATA_FILE = 'trading_data.json'
 
 
-class SNSHandler:
-    """Handle SNS notifications"""
-    
-    def __init__(self, config):
-        self.config = config
-        self.sns_client = config.get_sns_client()
-        self.topic_arn = config.sns_topic_arn
-    
-    def send_notification(self, email, subject, message):
-        """Send SNS notification"""
-        if not self.topic_arn:
-            print("SNS Topic ARN not configured")
-            return False
-        
+# Simulated stock data
+STOCK_DATABASE = {
+    'AAPL': {'name': 'Apple Inc.', 'price': 182.45, 'change': 2.35},
+    'GOOGL': {'name': 'Alphabet Inc.', 'price': 140.82, 'change': -1.15},
+    'MSFT': {'name': 'Microsoft Corp.', 'price': 380.61, 'change': 3.22},
+    'AMZN': {'name': 'Amazon.com Inc.', 'price': 181.92, 'change': -0.88},
+    'TSLA': {'name': 'Tesla Inc.', 'price': 238.45, 'change': 5.67},
+    'META': {'name': 'Meta Platforms', 'price': 485.72, 'change': 8.34},
+    'NFLX': {'name': 'Netflix Inc.', 'price': 247.18, 'change': -2.10},
+    'NVIDIA': {'name': 'NVIDIA Corp.', 'price': 875.29, 'change': 12.45},
+}
+
+def load_data():
+    """Load user data from JSON file"""
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_data(data):
+    """Save user data to JSON file"""
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def send_notification(username, subject, message):
+    """Send SNS notification"""
+    if SNS_ENABLED and sns_client:
         try:
-            response = self.sns_client.publish(
-                TopicArn=self.topic_arn,
+            sns_client.publish(
+                TopicArn=SNS_TOPIC_ARN,
                 Subject=subject,
-                Message=message,
-                MessageAttributes={
-                    'email': {'DataType': 'String', 'StringValue': email}
-                }
+                Message=f"User: {username}\n\n{message}"
             )
-            print(f"Notification sent. Message ID: {response['MessageId']}")
-            return True
-        except ClientError as e:
-            print(f"Error sending notification: {e}")
-            return False
-    
-    def send_trade_notification(self, username, trade_type, symbol, quantity, price):
-        """Send trade execution notification"""
-        subject = f"Trade Executed: {trade_type} {quantity} shares of {symbol}"
-        message = f"""
-Trade Confirmation
-
-User: {username}
-Action: {trade_type}
-Symbol: {symbol}
-Quantity: {quantity} shares
-Price: ${price:.2f}
-Total: ${float(quantity) * float(price):.2f}
-
-Time: {datetime.utcnow().isoformat()}
-        """
-        return self.send_notification(username, subject, message)
-
-
-class AWSManager:
-    """Main AWS Manager - Unified interface"""
-    
-    def __init__(self):
-        self.config = AWSConfig()
-        self.dynamodb = DynamoDBHandler(self.config)
-        self.sns = SNSHandler(self.config)
-    
-    def initialize(self):
-        """Initialize AWS resources"""
-        print("Initializing AWS resources...")
-        self.dynamodb.init_stocks_if_needed()
-        print("AWS resources initialized successfully")
-    
-    def health_check(self):
-        """Check AWS connectivity"""
-        try:
-            # Try to list tables
-            dynamodb = self.config.get_dynamodb_resource()
-            tables = dynamodb.tables.all()
-            required_tables = ['StockTradingUsers', 'StockTradingPortfolios', 
-                             'StockTradingTransactions', 'StockTradingStocks']
-            
-            existing_tables = [t.name for t in tables]
-            missing_tables = [t for t in required_tables if t not in existing_tables]
-            
-            if missing_tables:
-                print(f"Missing tables: {missing_tables}")
-                return False
-            
-            return True
         except Exception as e:
-            print(f"Health check failed: {e}")
-            return False
+            print(f"Error sending SNS notification: {e}")
 
+def login_required(f):
+    """Decorator for routes that require authentication"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'username' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
-# Global AWS Manager instance
-aws_manager = AWSManager()
+def init_user(username):
+    """Initialize a new user with default portfolio"""
+    if USE_DYNAMODB and aws_manager:
+        # Ensure user exists in DynamoDB
+        user = aws_manager.dynamodb.get_user(username)
+        if not user:
+            # create with empty password placeholder; signup should set real password
+            aws_manager.dynamodb.create_user(username, '')
+            user = aws_manager.dynamodb.get_user(username)
+        return user
 
+    data = load_data()
+    if username not in data:
+        data[username] = {
+            'password': '',
+            'balance': 10000.00,  # Virtual currency allocation
+            'portfolio': {},  # {symbol: {'shares': int, 'avg_price': float}}
+            'transactions': [],  # Transaction history
+            'created_at': datetime.now().isoformat()
+        }
+        save_data(data)
+    return data[username]
+
+@app.route('/')
+def index():
+    if 'username' in session:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/signup', methods=['GET', 'POST'])
+def signup():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        
+        if not username or not password:
+            flash('Username and password are required!', 'error')
+            return redirect(url_for('signup'))
+        
+        if password != confirm_password:
+            flash('Passwords do not match!', 'error')
+            return redirect(url_for('signup'))
+        
+        if USE_DYNAMODB and aws_manager:
+            # Check in DynamoDB
+            existing = aws_manager.dynamodb.get_user(username)
+            if existing:
+                flash('Username already exists!', 'error')
+                return redirect(url_for('signup'))
+            # Note: password should be hashed in production
+            aws_manager.dynamodb.create_user(username, password)
+            flash('Account created successfully! Please log in.', 'success')
+            return redirect(url_for('login'))
+
+        data = load_data()
+        if username in data:
+            flash('Username already exists!', 'error')
+            return redirect(url_for('signup'))
+        
+        # Create new user
+        data[username] = {
+            'password': password,  # In production, hash this!
+            'balance': 10000.00,
+            'portfolio': {},
+            'transactions': [],
+            'created_at': datetime.now().isoformat()
+        }
+        save_data(data)
+        
+        flash('Account created successfully! Please log in.', 'success')
+        return redirect(url_for('login'))
+    
+    return render_template('signup.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        if USE_DYNAMODB and aws_manager:
+            user = aws_manager.dynamodb.get_user(username)
+            if user and user.get('password') == password:
+                session['username'] = username
+                flash('Login successful!', 'success')
+                return redirect(url_for('dashboard'))
+            flash('Invalid username or password!', 'error')
+            return render_template('login.html')
+
+        data = load_data()
+        if username in data and data[username]['password'] == password:
+            session['username'] = username
+            flash('Login successful!', 'success')
+            return redirect(url_for('dashboard'))
+        
+        flash('Invalid username or password!', 'error')
+    
+    return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.pop('username', None)
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    username = session['username']
+    data = load_data()
+    user_data = data.get(username, {})
+    
+    # Calculate portfolio value
+    portfolio_value = 0
+    portfolio_details = []
+    
+    for symbol, holdings in user_data.get('portfolio', {}).items():
+        if symbol in STOCK_DATABASE:
+            current_price = STOCK_DATABASE[symbol]['price']
+            shares = holdings['shares']
+            position_value = current_price * shares
+            portfolio_value += position_value
+            
+            portfolio_details.append({
+                'symbol': symbol,
+                'name': STOCK_DATABASE[symbol]['name'],
+                'shares': shares,
+                'avg_price': holdings['avg_price'],
+                'current_price': current_price,
+                'position_value': position_value,
+                'gain_loss': position_value - (holdings['avg_price'] * shares)
+            })
+    
+    total_value = user_data.get('balance', 0) + portfolio_value
+    
+    return render_template('dashboard.html', 
+                         username=username,
+                         balance=user_data.get('balance', 0),
+                         portfolio=portfolio_details,
+                         portfolio_value=portfolio_value,
+                         total_value=total_value,
+                         transactions=user_data.get('transactions', [])[-10:])  # Last 10 transactions
+
+@app.route('/api/stocks')
+@login_required
+def get_stocks():
+    """API endpoint to get available stocks"""
+    stocks = []
+    for symbol, data in STOCK_DATABASE.items():
+        stocks.append({
+            'symbol': symbol,
+            'name': data['name'],
+            'price': data['price'],
+            'change': data['change']
+        })
+    return jsonify(stocks)
+
+@app.route('/trade')
+@login_required
+def trade():
+    """Stock trading interface"""
+    return render_template('trade.html', stocks=STOCK_DATABASE)
+
+@app.route('/api/stock/<symbol>')
+@login_required
+def get_stock_details(symbol):
+    """Get details for a specific stock"""
+    symbol = symbol.upper()
+    if symbol in STOCK_DATABASE:
+        stock = STOCK_DATABASE[symbol]
+        return jsonify({
+            'symbol': symbol,
+            'name': stock['name'],
+            'price': stock['price'],
+            'change': stock['change'],
+            'found': True
+        })
+    return jsonify({'found': False, 'error': 'Stock not found'}), 404
+
+@app.route('/api/stock/<symbol>/history')
+@login_required
+def get_stock_history(symbol):
+    """Get historical price data for a stock with different timeframes"""
+    import random
+    from datetime import timedelta
+    
+    symbol = symbol.upper()
+    if symbol not in STOCK_DATABASE:
+        return jsonify({'error': 'Stock not found'}), 404
+    
+    # Get timeframe from query parameter (default: 1m for 1 month)
+    timeframe = request.args.get('timeframe', '1m')
+    
+    # Validate timeframe
+    if timeframe not in ['5m', '1w', '1m']:
+        timeframe = '1m'
+    
+    current_price = STOCK_DATABASE[symbol]['price']
+    base_price = current_price
+    labels = []
+    prices = []
+    
+    if timeframe == '5m':
+        # 5 minutes: 12 data points (1 hour)
+        num_points = 12
+        for i in range(num_points, 0, -1):
+            minutes = i * 5
+            time_str = f"{minutes//60:02d}:{minutes%60:02d}"
+            # Very small volatility for intraday (±0.5%)
+            price_change = random.uniform(-0.5, 0.5)
+            current_price = current_price * (1 + price_change / 100)
+            current_price = max(base_price * 0.995, min(current_price, base_price * 1.005))
+            prices.append(round(current_price, 2))
+            labels.append(time_str)
+    
+    elif timeframe == '1w':
+        # 1 week: 7 daily data points
+        num_points = 7
+        for i in range(num_points, 0, -1):
+            date = (datetime.now() - timedelta(days=i)).strftime('%a %m/%d')
+            # Moderate volatility (±1%)
+            daily_change = random.uniform(-1.0, 1.0)
+            current_price = current_price * (1 + daily_change / 100)
+            current_price = max(base_price * 0.93, min(current_price, base_price * 1.07))
+            prices.append(round(current_price, 2))
+            labels.append(date)
+    
+    else:  # 1m (1 month)
+        # 1 month: 30 daily data points
+        num_points = 30
+        for i in range(num_points, 0, -1):
+            date = (datetime.now() - timedelta(days=i)).strftime('%m/%d')
+            # Standard volatility (±1.5%)
+            daily_change = random.uniform(-1.5, 1.5)
+            current_price = current_price * (1 + daily_change / 100)
+            current_price = max(base_price * 0.85, min(current_price, base_price * 1.15))
+            prices.append(round(current_price, 2))
+            labels.append(date)
+    
+    return jsonify({
+        'symbol': symbol,
+        'labels': labels,
+        'prices': prices,
+        'current_price': STOCK_DATABASE[symbol]['price'],
+        'change': STOCK_DATABASE[symbol]['change']
+    })
+
+@app.route('/api/buy', methods=['POST'])
+@login_required
+def buy_stock():
+    """Execute a buy order"""
+    username = session['username']
+    symbol = request.json.get('symbol', '').upper()
+    quantity = int(request.json.get('quantity', 0))
+
+    if symbol not in STOCK_DATABASE:
+        return jsonify({'success': False, 'error': 'Stock not found'}), 400
+
+    if quantity <= 0:
+        return jsonify({'success': False, 'error': 'Quantity must be positive'}), 400
+
+    stock_price = STOCK_DATABASE[symbol]['price']
+    total_cost = stock_price * quantity
+
+    # DynamoDB-backed flow
+    if USE_DYNAMODB and aws_manager:
+        # Get user and balance
+        user = aws_manager.dynamodb.get_user(username) or {}
+        balance = float(user.get('balance', 0))
+
+        if total_cost > balance:
+            return jsonify({'success': False, 'error': 'Insufficient balance'}), 400
+
+        new_balance = balance - total_cost
+        # Update balance in DynamoDB
+        aws_manager.dynamodb.update_user_balance(username, new_balance)
+
+        # Update portfolio
+        portfolio_item = aws_manager.dynamodb.get_portfolio(username) or {}
+        holdings = portfolio_item.get('holdings', {})
+
+        # Normalize holdings (may contain Decimal)
+        normalized = {}
+        for sym, val in holdings.items():
+            normalized[sym] = {
+                'shares': int(val.get('shares', 0)),
+                'avg_price': float(val.get('avg_price', 0)),
+                'current_price': float(val.get('current_price', STOCK_DATABASE.get(sym, {}).get('price', 0)))
+            }
+
+        if symbol in normalized:
+            old_shares = normalized[symbol]['shares']
+            old_avg = normalized[symbol]['avg_price']
+            new_shares = old_shares + quantity
+            new_avg = (old_avg * old_shares + stock_price * quantity) / new_shares
+            normalized[symbol]['shares'] = new_shares
+            normalized[symbol]['avg_price'] = new_avg
+            normalized[symbol]['current_price'] = stock_price
+        else:
+            normalized[symbol] = {'shares': quantity, 'avg_price': stock_price, 'current_price': stock_price}
+
+        aws_manager.dynamodb.update_portfolio(username, normalized)
+
+        # Record transaction in DynamoDB
+        tx_id = aws_manager.dynamodb.add_transaction(username, 'BUY', symbol, quantity, stock_price, total_cost)
+
+        # Send SNS notification if configured
+        try:
+            aws_manager.sns.send_trade_notification(username, 'BUY', symbol, quantity, stock_price)
+        except Exception:
+            pass
+
+        return jsonify({'success': True, 'message': f'Successfully bought {quantity} shares of {symbol}', 'transaction_id': tx_id, 'new_balance': new_balance})
+
+    # Local JSON flow (fallback)
+    data = load_data()
+    user_data = data[username]
+
+    balance = user_data.get('balance', 0)
+    if total_cost > balance:
+        return jsonify({'success': False, 'error': 'Insufficient balance'}), 400
+
+    # Update balance
+    user_data['balance'] -= total_cost
+
+    # Update portfolio
+    if 'portfolio' not in user_data:
+        user_data['portfolio'] = {}
+
+    if symbol in user_data['portfolio']:
+        old_shares = user_data['portfolio'][symbol]['shares']
+        old_avg_price = user_data['portfolio'][symbol]['avg_price']
+        new_shares = old_shares + quantity
+        new_avg_price = (old_avg_price * old_shares + stock_price * quantity) / new_shares
+        user_data['portfolio'][symbol]['shares'] = new_shares
+        user_data['portfolio'][symbol]['avg_price'] = new_avg_price
+    else:
+        user_data['portfolio'][symbol] = {'shares': quantity, 'avg_price': stock_price}
+
+    # Record transaction
+    transaction = {
+        'id': str(uuid.uuid4()),
+        'type': 'BUY',
+        'symbol': symbol,
+        'quantity': quantity,
+        'price': stock_price,
+        'total': total_cost,
+        'timestamp': datetime.now().isoformat(),
+        'status': 'CONFIRMED'
+    }
+    user_data['transactions'].append(transaction)
+
+    save_data(data)
+
+    # Send notification
+    message = f"Buy Order Confirmed!\n\nSymbol: {symbol}\nQuantity: {quantity}\nPrice: ${stock_price}\nTotal: ${total_cost:.2f}"
+    send_notification(username, "Stock Purchase Confirmed", message)
+
+    return jsonify({'success': True, 'message': f'Successfully bought {quantity} shares of {symbol}', 'transaction_id': transaction['id'], 'new_balance': user_data['balance']})
+
+@app.route('/api/sell', methods=['POST'])
+@login_required
+def sell_stock():
+    """Execute a sell order"""
+    username = session['username']
+    symbol = request.json.get('symbol', '').upper()
+    quantity = int(request.json.get('quantity', 0))
+
+    if symbol not in STOCK_DATABASE:
+        return jsonify({'success': False, 'error': 'Stock not found'}), 400
+
+    if quantity <= 0:
+        return jsonify({'success': False, 'error': 'Quantity must be positive'}), 400
+
+    # DynamoDB-backed flow
+    if USE_DYNAMODB and aws_manager:
+        portfolio_item = aws_manager.dynamodb.get_portfolio(username) or {}
+        holdings = portfolio_item.get('holdings', {})
+
+        # Normalize holdings
+        normalized = {}
+        for sym, val in holdings.items():
+            normalized[sym] = {
+                'shares': int(val.get('shares', 0)),
+                'avg_price': float(val.get('avg_price', 0)),
+                'current_price': float(val.get('current_price', STOCK_DATABASE.get(sym, {}).get('price', 0)))
+            }
+
+        if symbol not in normalized or normalized[symbol]['shares'] < quantity:
+            owned = normalized.get(symbol, {}).get('shares', 0)
+            return jsonify({'success': False, 'error': f'Insufficient shares. You own {owned}'}), 400
+
+        stock_price = STOCK_DATABASE[symbol]['price']
+        total_proceeds = stock_price * quantity
+
+        # Update balance
+        user = aws_manager.dynamodb.get_user(username) or {}
+        balance = float(user.get('balance', 0))
+        new_balance = balance + total_proceeds
+        aws_manager.dynamodb.update_user_balance(username, new_balance)
+
+        # Update holdings
+        normalized[symbol]['shares'] -= quantity
+        if normalized[symbol]['shares'] == 0:
+            del normalized[symbol]
+
+        aws_manager.dynamodb.update_portfolio(username, normalized)
+
+        # Record transaction
+        tx_id = aws_manager.dynamodb.add_transaction(username, 'SELL', symbol, quantity, stock_price, total_proceeds)
+
+        try:
+            aws_manager.sns.send_trade_notification(username, 'SELL', symbol, quantity, stock_price)
+        except Exception:
+            pass
+
+        return jsonify({'success': True, 'message': f'Successfully sold {quantity} shares of {symbol}', 'transaction_id': tx_id, 'new_balance': new_balance})
+
+    # Local JSON flow
+    data = load_data()
+    user_data = data[username]
+
+    if symbol not in user_data.get('portfolio', {}):
+        return jsonify({'success': False, 'error': 'You do not own this stock'}), 400
+
+    owned_shares = user_data['portfolio'][symbol]['shares']
+    if quantity > owned_shares:
+        return jsonify({'success': False, 'error': f'Insufficient shares. You own {owned_shares}'}), 400
+
+    stock_price = STOCK_DATABASE[symbol]['price']
+    total_proceeds = stock_price * quantity
+
+    # Update balance
+    user_data['balance'] += total_proceeds
+
+    # Update portfolio
+    user_data['portfolio'][symbol]['shares'] -= quantity
+    if user_data['portfolio'][symbol]['shares'] == 0:
+        del user_data['portfolio'][symbol]
+
+    # Record transaction
+    transaction = {
+        'id': str(uuid.uuid4()),
+        'type': 'SELL',
+        'symbol': symbol,
+        'quantity': quantity,
+        'price': stock_price,
+        'total': total_proceeds,
+        'timestamp': datetime.now().isoformat(),
+        'status': 'CONFIRMED'
+    }
+    user_data['transactions'].append(transaction)
+
+    save_data(data)
+
+    # Send notification
+    message = f"Sell Order Confirmed!\n\nSymbol: {symbol}\nQuantity: {quantity}\nPrice: ${stock_price}\nTotal Proceeds: ${total_proceeds:.2f}"
+    send_notification(username, "Stock Sale Confirmed", message)
+
+    return jsonify({'success': True, 'message': f'Successfully sold {quantity} shares of {symbol}', 'transaction_id': transaction['id'], 'new_balance': user_data['balance']})
+
+@app.route('/portfolio')
+@login_required
+def portfolio():
+    """Portfolio management page"""
+    username = session['username']
+    data = load_data()
+    user_data = data.get(username, {})
+    
+    portfolio_details = []
+    for symbol, holdings in user_data.get('portfolio', {}).items():
+        if symbol in STOCK_DATABASE:
+            current_price = STOCK_DATABASE[symbol]['price']
+            shares = holdings['shares']
+            position_value = current_price * shares
+            
+            portfolio_details.append({
+                'symbol': symbol,
+                'name': STOCK_DATABASE[symbol]['name'],
+                'shares': shares,
+                'avg_price': holdings['avg_price'],
+                'current_price': current_price,
+                'position_value': position_value,
+                'gain_loss': position_value - (holdings['avg_price'] * shares),
+                'gain_loss_percent': ((current_price - holdings['avg_price']) / holdings['avg_price'] * 100) if holdings['avg_price'] > 0 else 0
+            })
+    
+    return render_template('portfolio.html', portfolio=portfolio_details)
+
+@app.route('/transactions')
+@login_required
+def transactions():
+    """Transaction history page"""
+    username = session['username']
+    data = load_data()
+    user_data = data.get(username, {})
+    
+    transactions = user_data.get('transactions', [])
+    transactions.reverse()  # Show newest first
+    
+    return render_template('transactions.html', transactions=transactions)
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
